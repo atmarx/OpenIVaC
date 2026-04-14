@@ -1,0 +1,24 @@
+services:
+  openivac:
+    build: .
+    container_name: openivac
+    volumes:
+      - ./scripts:/app/scripts    # Your video scripts
+      - ./output:/app/output      # Generated videos + screenshots
+      - ./docs:/app/docs          # Source documentation (for generator)
+    environment:
+      - DEMO_BASE_URL=${DEMO_BASE_URL:-http://host.docker.internal:8000}
+      - DEMO_USERNAME=${DEMO_USERNAME:-admin}
+      - DEMO_PASSWORD=${DEMO_PASSWORD:-admin}
+      - DEMO_PACE=${DEMO_PACE:-1.0}
+      - TTS_ENABLED=${TTS_ENABLED:-true}
+      - TTS_ENDPOINT=http://tts:8100/v1
+      - TTS_VOICE=${TTS_VOICE:-shimmer}
+      - TTS_MODEL=${TTS_MODEL:-tts-1}
+      - TTS_SPEED=${TTS_SPEED:-1.0}
+
+  tts:
+    image: ghcr.io/matatonic/openedai-speech
+    container_name: openivac-tts
+    ports:
+      - "${TTS_PORT:-8100}:8000"
