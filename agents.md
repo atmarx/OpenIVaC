@@ -41,13 +41,24 @@ playwright install chromium
 export DEMO_BASE_URL=http://localhost:8000
 export DEMO_USERNAME=admin
 export DEMO_PASSWORD=admin
-export TTS_ENDPOINT=http://localhost:8100/v1  # openedai-speech
+
+# TTS -- pick a backend and point at your endpoint.
+export TTS_BACKEND=openai                      # "openai" or "fish"
+export TTS_ENDPOINT=http://localhost:8100/v1   # OpenAI-compatible (default)
+# or:
+# export TTS_BACKEND=fish
+# export TTS_ENDPOINT=http://your-fish-endpoint:8200
 export TTS_ENABLED=true
 
 python run.py
 ```
 
 Requires: Python 3.10+, ffmpeg (with libass for subtitle burning), a running TTS endpoint.
+
+### Picking a TTS backend
+
+- **`openai`** (default) -- any OpenAI-compatible TTS server (e.g. [openedai-speech](https://github.com/matatonic/openedai-speech)).  Fast, consistent, no voice cloning, no per-clip seed control.  Uses `TTS_VOICE` (e.g. `shimmer`, `nova`) for voice selection.
+- **`fish`** -- [Fish Speech 1.5](https://github.com/fishaudio/fish-speech) via its Gradio interface.  Supports preloaded reference voices and deterministic seeding, so the same cue renders identically every time and voices stay consistent across cues in a single video.  Slower than the openai backend; requires you to host Fish Speech yourself.
 
 ## How to write a video script
 
@@ -118,6 +129,8 @@ def run(headless: bool = True):
 
 **Narration:**
 - `demo.subtitle("Text to show and speak.")` -- records a timed subtitle cue, pauses execution for the duration
+- `demo.subtitle(text, voice="asker")` -- route this cue through the "asker" voice slot (see Voice cast below)
+- `demo.subtitle(text, emotion="(confident)")` -- attach emotion metadata to the cue.  **Reserved for future use** -- the current Fish Speech endpoint doesn't interpret parenthetical prefixes as emotion directives, so emotion is stored on the cue but not routed to the synth call.  Leave `emotion=` on cues you've annotated; it'll take effect if/when a backend supports it.
 
 **Timing:**
 - `beat()` -- 1s pause (UI change registered)
@@ -203,7 +216,70 @@ Change `VIEWPORT` in `config.py` for different resolutions.  Default is 1280x720
 
 ### TTS voice
 
-Set `TTS_VOICE` environment variable.  Available voices depend on your TTS endpoint.  Default is "shimmer" (clear, professional).
+Set `TTS_VOICE` environment variable.  Available voices depend on your TTS endpoint.  Default is "shimmer" (clear, professional on the openai backend).
+
+### Voice cast (Fish Speech backend)
+
+Fish Speech supports preloaded reference voices and deterministic seeds.  OpenIVaC routes every cue through a named **slot** -- by default, `"narrator"`.  Each slot locks a `(reference_id, seed)` tuple, so voice timbre and tempo stay consistent across cues in the same video instead of drifting per call.
+
+The default cast in `config.py`:
+
+```python
+VOICE_CAST = {
+    "narrator": ("female2", 42),   # the primary walkthrough voice
+    "asker":    ("female1", 137),  # the "how do I do this?" call voice
+}
+```
+
+Seeds are arbitrary integers; just keep them **fixed and non-zero**.  A zero seed tells Fish Speech to re-randomize per call, which causes the drift the slot system exists to prevent.
+
+**Single-narrator scripts** (most walkthroughs) do nothing extra -- all cues default to the narrator slot and a single voice walks the viewer through the entire video.
+
+**Call-and-answer scripts** (e.g. "How do I do this?" / "I'm glad you asked") mark question cues with `voice="asker"`:
+
+```python
+demo.subtitle("How do I set a budget?", voice="asker")
+demo.subtitle("Great question -- click the Budget tab on the left.", voice="narrator")
+```
+
+**Script-level cast override.**  Pin a specific voice per script without mutating the module-level cast:
+
+```python
+script = VideoScript(
+    id="myapp-mdp-01",
+    title="Tour",
+    target_audience="New users",
+    duration_estimate="~90s",
+    cast={"narrator": ("female3", 42)},  # this script uses female3
+)
+
+def run(headless: bool = True):
+    with DemoRunner(script.id, headless=headless, cast=script.cast) as demo:
+        ...
+```
+
+The openai backend ignores voice slots -- it keys on `TTS_VOICE` alone.  Slots apply only when `TTS_BACKEND=fish`.
+
+### Pronunciation dictionary
+
+Some acronyms read naturally as words ("SMB" is "essembee", not "ess em bee").  Numbers + storage units need expansion ("10TB" is "ten terabytes", not "ten tee bee").  Two dicts in `config.py` handle both:
+
+```python
+TTS_PRONUNCIATIONS = {
+    "SQL": "sequel",
+    "SaaS": "sass",
+    "JSON": "jay-sawn",
+    # add your domain-specific terms here
+}
+
+TTS_UNIT_EXPANSIONS = {
+    "TB": "terabytes", "GB": "gigabytes", "MB": "megabytes",
+    "Mbps": "megabits per second",
+    # etc.
+}
+```
+
+Subtitle text is untouched -- only the text fed to the TTS model gets substituted.  Generic acronyms not in the dict still fall back to the letter-by-letter spacing behavior (CSV -> "C S V").  Grow the dict reactively when you hear a new mispronunciation.
 
 ## Known gotchas
 

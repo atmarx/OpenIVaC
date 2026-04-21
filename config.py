@@ -10,15 +10,20 @@ Adapt to your project:
   - Set BASE_URL / credentials via environment variables
   - Override DemoRunner.login() if your auth flow differs
   - Adjust VIEWPORT for your app's layout
+  - Pick a TTS backend (openai-compatible or Fish Speech) and point at your endpoint
   - Everything else works as-is
 """
 
+import hashlib
+import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
+import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -44,12 +49,74 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 # 1.0 = normal narration pace, 0.5 = fast preview, 2.0 = slow/dramatic
 PACE = float(os.environ.get("DEMO_PACE", "1.0"))
 
-# TTS narration -- openedai-speech or any OpenAI-compatible TTS endpoint
+# TTS narration.  Two backends supported:
+#   "openai" -- any OpenAI-compatible TTS server (openedai-speech, etc.).
+#               Fast, consistent, no voice cloning.  Default.
+#   "fish"   -- Fish Speech 1.5 via its Gradio interface.  Voice cloning
+#               from preloaded references, deterministic seeding for voice
+#               continuity across cues.  Requires a Fish Speech endpoint.
+#
+# Point TTS_ENDPOINT at your chosen backend; OpenIVaC ships no hosted service.
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "openai").lower()  # "openai" or "fish"
 TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "http://localhost:8100/v1")
 TTS_VOICE = os.environ.get("TTS_VOICE", "shimmer")
 TTS_MODEL = os.environ.get("TTS_MODEL", "tts-1")
 TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Emotion tags on SubtitleCue are reserved metadata for a future backend that
+# interprets them.  The current Fish Speech endpoint reads parenthetical
+# prefixes like "(confident)" aloud as literal text, so we do not route them
+# to the synth call.  Setting TTS_EMOTIONS=true logs a notice and otherwise
+# has no effect -- leave emotion= on cues for future use.
+if os.environ.get("TTS_EMOTIONS", "").lower() in ("true", "1", "yes"):
+    print("  [config] TTS_EMOTIONS is set but emotion prefixing is disabled "
+          "pending a backend that interprets it.")
+
+
+# ---------------------------------------------------------------------------
+# Voice cast -- named slots lock (reference_id, seed) for deterministic playback
+# ---------------------------------------------------------------------------
+# Each cue routes through a slot ("narrator" by default).  Fish Speech uses
+# the slot's seed to keep timbre/tempo consistent across cues instead of
+# drifting per-call.  Seeds are arbitrary but fixed -- any non-zero int works,
+# the point is to lock them.
+#
+# Single-narrator scripts do nothing extra: all cues default to narrator.
+# Two-voice call-and-answer scripts mark the "asker" cues with voice="asker".
+#
+# Scripts can override the cast in two ways:
+#     from config import VOICE_CAST
+#     VOICE_CAST["narrator"] = ("female3", 42)
+# or declaratively on the VideoScript:
+#     script = VideoScript(id=..., title=..., cast={"narrator": ("female3", 42)})
+
+_FISH_VOICES = {"female1", "female2", "female3", "male1", "male2", "male3"}
+
+
+def _default_narrator_voice() -> str:
+    return TTS_VOICE if TTS_VOICE in _FISH_VOICES else "female2"
+
+
+VOICE_CAST: dict[str, tuple[str, int]] = {
+    "narrator": (_default_narrator_voice(), 42),
+    "asker": ("female1", 137),
+}
+
+
+def resolve_voice_slot(slot: str,
+                       overrides: Optional[dict[str, tuple[str, int]]] = None) -> tuple[str, int]:
+    """Resolve a slot name to (reference_id, seed).
+
+    Checks ``overrides`` first (per-runner/per-script), then VOICE_CAST.
+    Falls back to narrator if the slot is unknown so scripts never break on
+    typos.
+    """
+    if overrides and slot in overrides:
+        return overrides[slot]
+    if slot in VOICE_CAST:
+        return VOICE_CAST[slot]
+    return VOICE_CAST["narrator"]
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +163,9 @@ class VideoScript:
     target_audience: str
     duration_estimate: str           # e.g. "~5min"
     scenes: list[Scene] = field(default_factory=list)
+    # Optional voice-cast override, merged over VOICE_CAST.  Lets a script
+    # pin a specific voice/seed without mutating the module-level cast.
+    cast: dict[str, tuple[str, int]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +178,8 @@ class SubtitleCue:
     start: float   # seconds from recording start
     end: float     # seconds from recording start
     text: str
+    emotion: str = ""  # Reserved metadata; not currently routed to TTS.
+    voice: str = "narrator"  # voice-cast slot for Fish Speech backend
 
 
 def _format_srt_time(seconds: float) -> str:
@@ -171,12 +243,10 @@ def burn_subtitles(video_path: Path, srt_path: Path, output_path: Optional[Path]
         result = subprocess.run(cmd, capture_output=True, text=True)
         return result.returncode == 0
 
-    # Try host ffmpeg first (Flatpak sandboxes often lack libass)
     if shutil.which("flatpak-spawn"):
         if _run_ffmpeg(["flatpak-spawn", "--host"]):
             return output_path
 
-    # Try direct ffmpeg
     if _run_ffmpeg([]):
         return output_path
 
@@ -195,27 +265,329 @@ def burn_subtitles(video_path: Path, srt_path: Path, output_path: Optional[Path]
 # individually ("C S V") rather than guessing at pronunciation.
 _ACRONYM_RE = re.compile(r'\b([A-Z]{2,})\b')
 
+# Sonorous acronyms that read naturally as a word.  Keys are the source form
+# in scripts; values are the spoken form.  Grow reactively -- these are
+# starter entries; add your domain-specific terms here.
+TTS_PRONUNCIATIONS: dict[str, str] = {
+    "SQL": "sequel",
+    "SaaS": "sass",
+    "JSON": "jay-sawn",
+    "YAML": "yammel",
+    "OAuth": "oh-auth",
+}
 
-def _tts_preprocess(text: str) -> str:
+# Storage / bandwidth / time units that should be spoken in full when preceded
+# by a number.  "10TB" is otherwise pronounced "ten tee bee" by most TTS.
+TTS_UNIT_EXPANSIONS: dict[str, str] = {
+    "TB": "terabytes", "GB": "gigabytes", "MB": "megabytes", "KB": "kilobytes",
+    "PB": "petabytes", "TiB": "tebibytes", "GiB": "gibibytes", "MiB": "mebibytes",
+    "Mbps": "megabits per second", "Gbps": "gigabits per second",
+    "Kbps": "kilobits per second",
+    "ms": "milliseconds", "hrs": "hours", "mins": "minutes", "sec": "seconds",
+}
+
+_UNIT_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*(' +
+    "|".join(sorted(TTS_UNIT_EXPANSIONS.keys(), key=len, reverse=True)) +
+    r')\b'
+)
+
+# Safety net: scripts may still carry inline "(confident)" emotion prefixes
+# from earlier experiments or copy-paste.  Strip leading parens before
+# synthesis so no TTS backend reads them aloud as literal text.
+_LEADING_PAREN_RE = re.compile(r'^\s*\([^)]+\)\s*')
+
+_NUMBER_WORDS_SMALL = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+    "sixteen", "seventeen", "eighteen", "nineteen",
+]
+_NUMBER_WORDS_TENS = [
+    "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+    "eighty", "ninety",
+]
+
+
+def _int_to_words(n: int) -> str:
+    """Convert a non-negative integer (0-9999) to spoken-English words."""
+    if n < 0 or n > 9999:
+        return str(n)
+    if n < 20:
+        return _NUMBER_WORDS_SMALL[n]
+    if n < 100:
+        tens, ones = divmod(n, 10)
+        return _NUMBER_WORDS_TENS[tens] + (f"-{_NUMBER_WORDS_SMALL[ones]}" if ones else "")
+    if n < 1000:
+        hundreds, rest = divmod(n, 100)
+        base = f"{_NUMBER_WORDS_SMALL[hundreds]} hundred"
+        return f"{base} {_int_to_words(rest)}" if rest else base
+    thousands, rest = divmod(n, 1000)
+    base = f"{_NUMBER_WORDS_SMALL[thousands]} thousand"
+    return f"{base} {_int_to_words(rest)}" if rest else base
+
+
+def _number_to_words(token: str) -> str:
+    """Convert a numeric token (possibly with decimal) into spoken words."""
+    if "." in token:
+        whole, frac = token.split(".", 1)
+        whole_words = _int_to_words(int(whole)) if whole else "zero"
+        frac_words = " ".join(_NUMBER_WORDS_SMALL[int(d)] for d in frac if d.isdigit())
+        return f"{whole_words} point {frac_words}".strip()
+    try:
+        return _int_to_words(int(token))
+    except ValueError:
+        return token
+
+
+def _expand_units(text: str) -> str:
+    def repl(m: re.Match) -> str:
+        number, unit = m.group(1), m.group(2)
+        return f"{_number_to_words(number)} {TTS_UNIT_EXPANSIONS[unit]}"
+    return _UNIT_RE.sub(repl, text)
+
+
+def _apply_pronunciations(text: str) -> str:
+    for src, spoken in TTS_PRONUNCIATIONS.items():
+        text = re.sub(r'\b' + re.escape(src) + r'\b', spoken, text)
+    return text
+
+
+def _tts_preprocess(text: str, emotion: str = "") -> str:
     """Prepare subtitle text for TTS synthesis.
 
-    Spaces out acronyms so they're read as individual letters.
-    'Import from CSV source' -> 'Import from C S V source'
+    Passes, in order:
+      1. Unit expansion -- '10TB' -> 'ten terabytes'.
+      2. Pronunciation dict -- 'SQL' -> 'sequel'.
+      3. Acronym spacing -- remaining ALL-CAPS runs get 'C S V' treatment.
+      4. Emotion-prefix safety net -- strip any leading '(emotion) ' that
+         would otherwise be read aloud.
+
+    ``emotion`` is accepted for signature compatibility with the cue pipeline
+    but is no longer routed into the synth output.
     """
-    return _ACRONYM_RE.sub(lambda m: " ".join(m.group(1)), text)
+    processed = _expand_units(text)
+    processed = _apply_pronunciations(processed)
+    processed = _ACRONYM_RE.sub(lambda m: " ".join(m.group(1)), processed)
+    processed = _LEADING_PAREN_RE.sub("", processed)
+    return processed
+
+
+def _fish_speech_synthesize(text: str, output_path: Path,
+                            voice_ref: Optional[str] = None,
+                            voice_seed: Optional[int] = None) -> bool:
+    """Synthesize a single TTS clip via Fish Speech's Gradio interface.
+
+    Fish Speech 1.5 exposes a Gradio web UI (not a REST /v1/tts endpoint).
+    Uses gradio_client to call the inference function directly.
+
+    When ``voice_ref`` / ``voice_seed`` are omitted, the narrator slot from
+    VOICE_CAST is used.  A non-zero seed keeps rendered timbre consistent
+    across cues; seed=0 lets Fish re-randomize per call and causes drift.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        from gradio_client import Client, handle_file
+    except ImportError:
+        print("  gradio_client not installed -- run: pip install gradio_client")
+        return False
+
+    endpoint = TTS_ENDPOINT.rstrip("/")
+    if endpoint.endswith("/v1"):
+        endpoint = endpoint[:-3]
+
+    # reference_audio is a required FileData param even when reference_id
+    # resolves server-side to a preloaded voice.  Ship a 1-sec silent WAV.
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as _tmp:
+        _dummy = _tmp.name
+    with wave.open(_dummy, "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(struct.pack("<" + "h" * 16000, *([0] * 16000)))
+
+    if voice_ref is None or voice_seed is None:
+        narrator_ref, narrator_seed = VOICE_CAST["narrator"]
+        if voice_ref is None:
+            voice_ref = narrator_ref
+        if voice_seed is None:
+            voice_seed = narrator_seed
+    if voice_ref not in _FISH_VOICES:
+        voice_ref = "female2"
+
+    try:
+        gc = Client(endpoint, verbose=False)
+        result = gc.predict(
+            text,
+            voice_ref,
+            handle_file(_dummy),
+            "",
+            0,
+            200,
+            0.7,
+            1.2,
+            0.7,
+            voice_seed,
+            "on",
+            api_name="/partial",
+        )
+    except Exception as e:
+        print(f"  Fish Speech Gradio call failed: {e}")
+        return False
+
+    audio_path, err = result if isinstance(result, tuple) else (result, None)
+    if err:
+        print(f"  Fish Speech error: {err}")
+        return False
+    if not audio_path:
+        print("  Fish Speech: no audio path returned")
+        return False
+
+    src = Path(audio_path)
+    if not src.exists():
+        print(f"  Fish Speech: audio file not found at {src}")
+        return False
+
+    if src.suffix.lower() == ".mp3":
+        shutil.copy(src, output_path)
+        return True
+
+    prefix = ["flatpak-spawn", "--host"] if shutil.which("flatpak-spawn") else []
+    proc = subprocess.run(
+        prefix + ["ffmpeg", "-y", "-i", str(src), str(output_path)],
+        capture_output=True,
+    )
+    return proc.returncode == 0
+
+
+NARRATION_CACHE_DIR = OUTPUT_DIR / ".narration_cache"
+
+# Bump when preprocessor behavior changes so contaminated cached clips get
+# regenerated instead of re-used.
+_CACHE_VERSION = "v1"
+
+
+def _synthesize_to_path(text: str, emotion: str, output_path: Path,
+                        voice_slot: str = "narrator",
+                        cast_overrides: Optional[dict[str, tuple[str, int]]] = None) -> bool:
+    """Synthesize TTS audio for (text, emotion) into output_path.
+
+    Dispatches based on TTS_BACKEND.  Returns True on success.
+    """
+    tts_text = _tts_preprocess(text, emotion)
+    if TTS_BACKEND == "fish":
+        voice_ref, voice_seed = resolve_voice_slot(voice_slot, cast_overrides)
+        return _fish_speech_synthesize(tts_text, output_path, voice_ref, voice_seed)
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=TTS_ENDPOINT, api_key="unused")
+        with client.audio.speech.with_streaming_response.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=tts_text,
+            speed=TTS_SPEED,
+            response_format="mp3",
+        ) as response:
+            response.stream_to_file(str(output_path))
+        return True
+    except Exception as e:
+        print(f"  openai-compatible TTS synthesis failed: {e}")
+        return False
+
+
+def _ffprobe_duration(path: Path) -> Optional[float]:
+    prefix = ["flatpak-spawn", "--host"] if shutil.which("flatpak-spawn") else []
+    try:
+        proc = subprocess.run(
+            prefix + [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _narration_cache_key(text: str, emotion: str = "",
+                         voice_slot: str = "narrator",
+                         cast_overrides: Optional[dict[str, tuple[str, int]]] = None) -> str:
+    # Include the resolved (ref_id, seed) so a cast change invalidates the
+    # cache cleanly.  Emotion is not part of the key: it's metadata-only.
+    if TTS_BACKEND == "fish":
+        voice_ref, voice_seed = resolve_voice_slot(voice_slot, cast_overrides)
+        voice_key = f"{voice_slot}:{voice_ref}:{voice_seed}"
+    else:
+        voice_key = TTS_VOICE
+    key_str = f"{_CACHE_VERSION}||{text}||{voice_key}||{TTS_BACKEND}"
+    return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
+
+
+def narration_cache_paths(text: str, emotion: str = "",
+                          voice_slot: str = "narrator",
+                          cast_overrides: Optional[dict[str, tuple[str, int]]] = None) -> tuple[Path, Path]:
+    """Return (audio, meta) cache paths for a given cue."""
+    key = _narration_cache_key(text, emotion, voice_slot, cast_overrides)
+    return (
+        NARRATION_CACHE_DIR / f"{key}.mp3",
+        NARRATION_CACHE_DIR / f"{key}.json",
+    )
+
+
+def get_tts_duration(text: str, emotion: str = "",
+                     voice_slot: str = "narrator",
+                     cast_overrides: Optional[dict[str, tuple[str, int]]] = None) -> Optional[float]:
+    """Return the duration (seconds) of TTS audio for (text, emotion).
+
+    Cache hits skip synthesis.  Misses synthesize, measure, and write the
+    clip + metadata into output/.narration_cache/.  Returns None on failure;
+    callers fall back to a word-count estimate.
+    """
+    if not TTS_ENABLED:
+        return None
+    audio_path, meta_path = narration_cache_paths(text, emotion, voice_slot, cast_overrides)
+    if meta_path.exists() and audio_path.exists():
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            return float(data["duration"])
+        except (ValueError, KeyError, OSError):
+            pass
+    NARRATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if not _synthesize_to_path(text, emotion, audio_path, voice_slot, cast_overrides):
+        return None
+    duration = _ffprobe_duration(audio_path)
+    if duration is None:
+        return None
+    voice_ref, voice_seed = resolve_voice_slot(voice_slot, cast_overrides)
+    meta_path.write_text(json.dumps({
+        "duration": duration,
+        "text": text,
+        "emotion": emotion,
+        "voice_slot": voice_slot,
+        "voice_ref": voice_ref,
+        "voice_seed": voice_seed,
+        "backend": TTS_BACKEND,
+    }), encoding="utf-8")
+    return duration
 
 
 def parse_srt(srt_path: Path) -> list[SubtitleCue]:
     """Parse an SRT file back into SubtitleCue objects."""
     text = srt_path.read_text(encoding="utf-8")
     cues = []
-    # SRT blocks: index, timestamp line, text, blank line
     blocks = re.split(r"\n\n+", text.strip())
     for block in blocks:
         lines = block.strip().split("\n")
         if len(lines) < 3:
             continue
-        # lines[0] = index, lines[1] = timestamps, lines[2:] = text
         match = re.match(
             r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})",
             lines[1],
@@ -231,14 +603,21 @@ def parse_srt(srt_path: Path) -> list[SubtitleCue]:
 
 
 def add_narration(video_path: Path, srt_path: Path,
-                  output_path: Optional[Path] = None) -> Optional[Path]:
+                  output_path: Optional[Path] = None,
+                  cues: Optional[list[SubtitleCue]] = None,
+                  cast_overrides: Optional[dict[str, tuple[str, int]]] = None) -> Optional[Path]:
     """
     Synthesize TTS audio from subtitle cues and mix into the video.
 
-    Calls an OpenAI-compatible TTS endpoint for each cue, positions the
-    audio at the cue's start timestamp via ffmpeg adelay, mixes all clips
-    together, then muxes the result into the video.  Produces a
-    *_voiced.mp4 alongside the existing *_subtitled.mp4.
+    Dispatches to the active backend (openai-compatible or Fish Speech),
+    positions each clip at the cue's start timestamp via ffmpeg adelay, mixes
+    all clips, then muxes the result into the video.  Produces a *_voiced.mp4
+    alongside the existing *_subtitled.mp4.
+
+    Pass ``cues`` to preserve in-memory emotion + voice slot metadata that
+    would otherwise be lost in an SRT round-trip.  DemoRunner.narrate() does
+    this; the ``--narrate-only`` CLI path falls back to parse_srt which drops
+    emotion and voice (SRT has no field for either).
 
     Returns the output path, or None if TTS is disabled or fails.
     """
@@ -253,10 +632,11 @@ def add_narration(video_path: Path, srt_path: Path,
             video_path.stem.replace("_subtitled", "") + "_voiced.mp4"
         )
 
-    from openai import OpenAI
+    if TTS_BACKEND == "fish":
+        print(f"  Using Fish Speech backend at {TTS_ENDPOINT}")
 
-    client = OpenAI(base_url=TTS_ENDPOINT, api_key="unused")
-    cues = parse_srt(srt_path)
+    if cues is None:
+        cues = parse_srt(srt_path)
 
     if not cues:
         print("  No subtitle cues found -- skipping narration.")
@@ -266,19 +646,37 @@ def add_narration(video_path: Path, srt_path: Path,
     clip_paths = []
 
     try:
-        # Step 1: Synthesize each cue
+        # Step 1: Pull each cue from the narration cache, synthesizing on miss.
         for i, cue in enumerate(cues):
             clip_path = Path(tmpdir) / f"cue_{i:03d}.mp3"
-            tts_text = _tts_preprocess(cue.text)
-            print(f"  TTS [{i+1}/{len(cues)}]: {tts_text[:60]}...")
-            with client.audio.speech.with_streaming_response.create(
-                model=TTS_MODEL,
-                voice=TTS_VOICE,
-                input=tts_text,
-                speed=TTS_SPEED,
-                response_format="mp3",
-            ) as response:
-                response.stream_to_file(str(clip_path))
+            slot = cue.voice
+            cached_audio, cached_meta = narration_cache_paths(
+                cue.text, cue.emotion, slot, cast_overrides,
+            )
+            if cached_audio.exists():
+                print(f"  TTS [{i+1}/{len(cues)}]: [cached] {cue.text[:60]}...")
+                shutil.copy(cached_audio, clip_path)
+            else:
+                tts_text = _tts_preprocess(cue.text, cue.emotion)
+                print(f"  TTS [{i+1}/{len(cues)}]: {tts_text[:60]}...")
+                if not _synthesize_to_path(cue.text, cue.emotion, clip_path,
+                                           slot, cast_overrides):
+                    print(f"  Skipping cue {i+1} -- TTS synthesis failed")
+                    continue
+                NARRATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy(clip_path, cached_audio)
+                dur = _ffprobe_duration(clip_path)
+                if dur is not None:
+                    voice_ref, voice_seed = resolve_voice_slot(slot, cast_overrides)
+                    cached_meta.write_text(json.dumps({
+                        "duration": dur,
+                        "text": cue.text,
+                        "emotion": cue.emotion,
+                        "voice_slot": slot,
+                        "voice_ref": voice_ref,
+                        "voice_seed": voice_seed,
+                        "backend": TTS_BACKEND,
+                    }), encoding="utf-8")
             clip_paths.append((cue.start, clip_path))
 
         # Step 2: Build a mixed audio track with clips at correct offsets
@@ -381,7 +779,8 @@ class DemoRunner:
     """
 
     def __init__(self, video_id: str, headless: bool = True,
-                 auto_capture: bool = True):
+                 auto_capture: bool = True,
+                 cast: Optional[dict[str, tuple[str, int]]] = None):
         self.video_id = video_id
         self.headless = headless
         self.auto_capture = auto_capture
@@ -391,11 +790,11 @@ class DemoRunner:
         self.page: Optional[Page] = None
         self.output_path = OUTPUT_DIR / video_id
         self.output_path.mkdir(parents=True, exist_ok=True)
-        # Subtitle tracking
         self._recording_start: float = 0.0
         self._subtitles: list[SubtitleCue] = []
-        # Auto-capture step counter
         self._step_count: int = 0
+        # Per-runner voice-cast overrides -- merged over VOICE_CAST per lookup.
+        self.cast: dict[str, tuple[str, int]] = dict(cast) if cast else {}
 
     def __enter__(self) -> "DemoRunner":
         self._pw = sync_playwright().start()
@@ -417,14 +816,12 @@ class DemoRunner:
         if self._pw:
             self._pw.stop()
 
-        # Rename the auto-generated video file to something predictable
         for f in self.output_path.glob("*.webm"):
             final = self.output_path / f"{self.video_id}.webm"
             if f != final:
                 f.rename(final)
             break
 
-        # Write SRT subtitle file if any cues were recorded
         if self._subtitles:
             srt_path = self.output_path / f"{self.video_id}.srt"
             write_srt(self._subtitles, srt_path)
@@ -474,12 +871,7 @@ class DemoRunner:
     # -- Visual helpers ----------------------------------------------------
 
     def _auto_capture(self, label: str = "") -> Optional[Path]:
-        """Capture a WebP screenshot if auto_capture is enabled.
-
-        Called automatically after each action method.  Screenshots are
-        numbered sequentially: step_001_login.webp, step_002_navigate.webp,
-        etc.
-        """
+        """Capture a WebP screenshot if auto_capture is enabled."""
         if not self.auto_capture or not self.page:
             return None
         self._step_count += 1
@@ -488,11 +880,6 @@ class DemoRunner:
         return self._save_screenshot(name, fmt="webp")
 
     def _save_screenshot(self, name: str, fmt: str = "webp") -> Path:
-        """Capture a screenshot and convert to the requested format.
-
-        Playwright captures PNG natively.  For WebP, we capture PNG then
-        convert via Pillow -- same pixel data, ~60-80% smaller files.
-        """
         png_path = self.output_path / f"{name}.png"
         self.page.screenshot(path=str(png_path))
         if fmt == "webp":
@@ -504,10 +891,7 @@ class DemoRunner:
         return png_path
 
     def screenshot(self, name: str, fmt: str = "webp") -> Path:
-        """Take a named screenshot.  Defaults to WebP.
-
-        Use fmt="png" if you need lossless output for specific comparisons.
-        """
+        """Take a named screenshot.  Defaults to WebP."""
         return self._save_screenshot(name, fmt=fmt)
 
     def hover_over(self, selector: str) -> None:
@@ -529,10 +913,7 @@ class DemoRunner:
         self._auto_capture("scroll")
 
     def highlight_area(self, selector: str) -> None:
-        """
-        Briefly outline an element to draw viewer attention.
-        Adds a red border, pauses, then removes it.
-        """
+        """Briefly outline an element to draw viewer attention."""
         self.page.eval_on_selector(
             selector,
             """el => {
@@ -551,38 +932,44 @@ class DemoRunner:
 
     # -- Subtitles ---------------------------------------------------------
 
-    def subtitle(self, text: str, duration: float = 0.0) -> None:
+    def subtitle(self, text: str, duration: float = 0.0, emotion: str = "",
+                 voice: str = "narrator") -> None:
         """
         Record a subtitle cue at the current timestamp.
 
-        If duration is 0, it's estimated from word count (~150 wpm).
-        Also pauses execution so the subtitle stays on screen during
-        recording.
+        If duration is 0, it's derived from actual TTS audio length (falls
+        back to a word-count estimate when TTS is off or synth fails).
+
+        ``voice`` picks a voice-cast slot (default ``"narrator"``).  For
+        call-and-answer scripts, mark question cues with ``voice="asker"``
+        and the answers default to narrator.
+
+        ``emotion`` is reserved metadata -- stored on the cue but not routed
+        to the current TTS backend.
         """
         now = time.time() - self._recording_start
 
-        # Close the previous open-ended cue
         if self._subtitles and self._subtitles[-1].end == 0.0:
             self._subtitles[-1].end = now
 
-        # Estimate duration from text length if not specified:
-        # ~150 words per minute = ~2.5 words per second
         if duration == 0.0:
-            word_count = len(text.split())
-            duration = max(2.5, word_count / 2.5)  # at least 2.5s
+            tts_duration = get_tts_duration(text, emotion, voice, self.cast)
+            if tts_duration is not None:
+                duration = tts_duration + 0.3  # 300ms visual tail after voice
+            else:
+                word_count = len(text.split())
+                duration = max(2.5, word_count / 2.5)
 
-        cue = SubtitleCue(start=now, end=now + duration, text=text)
+        cue = SubtitleCue(start=now, end=now + duration, text=text,
+                          emotion=emotion, voice=voice)
         self._subtitles.append(cue)
 
-        # Pause so the subtitle is visible during recording
         pause(duration)
 
     def merge_subtitles(self) -> Optional[Path]:
         """
         Burn the SRT file into the video.  Call AFTER the context manager
-        exits (i.e., after the `with DemoRunner(...) as demo:` block).
-
-        Returns the path to the subtitled MP4, or None if ffmpeg fails.
+        exits.  Returns the path to the subtitled MP4, or None if ffmpeg fails.
         """
         video_path = self.output_path / f"{self.video_id}.webm"
         srt_path = self.output_path / f"{self.video_id}.srt"
@@ -604,11 +991,13 @@ class DemoRunner:
         Add TTS voice narration to the subtitled video.  Call AFTER
         merge_subtitles().  Only runs when TTS_ENABLED is true.
 
-        Returns the path to the voiced MP4, or None if skipped/failed.
+        Passes in-memory cues so emotion + voice slot metadata is preserved.
         """
         subtitled = self.output_path / f"{self.video_id}_subtitled.mp4"
         srt_path = self.output_path / f"{self.video_id}.srt"
-        return add_narration(subtitled, srt_path)
+        return add_narration(subtitled, srt_path,
+                             cues=self._subtitles if self._subtitles else None,
+                             cast_overrides=self.cast or None)
 
     # -- Flash / toast dismissal -------------------------------------------
 
