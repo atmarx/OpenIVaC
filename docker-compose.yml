@@ -12,7 +12,13 @@ services:
       - DEMO_PASSWORD=${DEMO_PASSWORD:-admin}
       - DEMO_PACE=${DEMO_PACE:-1.0}
       - TTS_ENABLED=${TTS_ENABLED:-true}
+      # The bundled `tts` sidecar is OpenAI-compatible, so this compose pins the
+      # openai backend.  config.py's default is bark-local (our production
+      # backend) -- to use it here, run a Bark daemon and set:
+      #   TTS_BACKEND=bark-local BARK_ENDPOINT=http://host.docker.internal:8202
+      - TTS_BACKEND=${TTS_BACKEND:-openai}
       - TTS_ENDPOINT=http://tts:8100/v1
+      - BARK_ENDPOINT=${BARK_ENDPOINT:-http://host.docker.internal:8202}
       - TTS_VOICE=${TTS_VOICE:-shimmer}
       - TTS_MODEL=${TTS_MODEL:-tts-1}
       - TTS_SPEED=${TTS_SPEED:-1.0}

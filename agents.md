@@ -43,9 +43,11 @@ export DEMO_USERNAME=admin
 export DEMO_PASSWORD=admin
 
 # TTS -- pick a backend and point at your endpoint.
-export TTS_BACKEND=openai                      # "openai" or "fish"
-export TTS_ENDPOINT=http://localhost:8100/v1   # OpenAI-compatible (default)
+export TTS_BACKEND=bark-local                  # "bark-local" (default), "openai", or "fish"
+export BARK_ENDPOINT=http://localhost:8202     # local Bark daemon
 # or:
+# export TTS_BACKEND=openai
+# export TTS_ENDPOINT=http://localhost:8100/v1 # OpenAI-compatible
 # export TTS_BACKEND=fish
 # export TTS_ENDPOINT=http://your-fish-endpoint:8200
 export TTS_ENABLED=true
@@ -57,8 +59,9 @@ Requires: Python 3.10+, ffmpeg (with libass for subtitle burning), a running TTS
 
 ### Picking a TTS backend
 
-- **`openai`** (default) -- any OpenAI-compatible TTS server (e.g. [openedai-speech](https://github.com/matatonic/openedai-speech)).  Fast, consistent, no voice cloning, no per-clip seed control.  Uses `TTS_VOICE` (e.g. `shimmer`, `nova`) for voice selection.
-- **`fish`** -- [Fish Speech 1.5](https://github.com/fishaudio/fish-speech) via its Gradio interface.  Supports preloaded reference voices and deterministic seeding, so the same cue renders identically every time and voices stay consistent across cues in a single video.  Slower than the openai backend; requires you to host Fish Speech yourself.
+- **`bark-local`** (default) -- Suno [Bark](https://github.com/suno-ai/bark) behind a small local HTTP daemon (`POST /generate` -> base64 WAV).  Fully offline, MIT-licensed, expressive -- the backend we run in production.  Synthesizes one sentence at a time and stitches the clips with a `BARK_SILENCE_MS` gap (Bark degrades on long inputs), and a deterministic `seed` keeps the voice stable across a video.  Picks a voice from Bark's built-in presets (`v2/en_speaker_0` .. `v2/en_speaker_9`) via the voice cast.  Knobs: `BARK_ENDPOINT`, `BARK_SEMANTIC_TEMP`, `BARK_COARSE_TEMP`, `BARK_FINE_TEMP`, `BARK_SILENCE_MS`, `BARK_SPEED` (pitch-preserving atempo lift, default 1.08, folded into the cache key).
+- **`openai`** -- any OpenAI-compatible TTS server (e.g. [openedai-speech](https://github.com/matatonic/openedai-speech)).  Fast, consistent, no voice cloning, no per-clip seed control.  Uses `TTS_VOICE` (e.g. `shimmer`, `nova`) for voice selection.
+- **`fish`** -- [Fish Speech 1.5](https://github.com/fishaudio/fish-speech) via its Gradio interface.  Supports preloaded reference voices and deterministic seeding, so the same cue renders identically every time and voices stay consistent across cues in a single video.  Slower than the openai backend; requires you to host Fish Speech yourself.  Check its licence before shipping output -- that friction is what moved our production stack to Bark.
 
 ## How to write a video script
 
@@ -218,20 +221,27 @@ Change `VIEWPORT` in `config.py` for different resolutions.  Default is 1280x720
 
 Set `TTS_VOICE` environment variable.  Available voices depend on your TTS endpoint.  Default is "shimmer" (clear, professional on the openai backend).
 
-### Voice cast (Fish Speech backend)
+### Voice cast (Bark and Fish Speech backends)
 
-Fish Speech supports preloaded reference voices and deterministic seeds.  OpenIVaC routes every cue through a named **slot** -- by default, `"narrator"`.  Each slot locks a `(reference_id, seed)` tuple, so voice timbre and tempo stay consistent across cues in the same video instead of drifting per call.
+Both the `bark-local` and `fish` backends support deterministic seeding.  OpenIVaC routes every cue through a named **slot** -- by default, `"narrator"`.  Each slot locks a `(voice, seed)` tuple, so voice timbre and tempo stay consistent across cues in the same video instead of drifting per call.
 
-The default cast in `config.py`:
+Each backend resolves slots from its own cast table in `config.py` -- Bark uses preset names, Fish uses reference-voice names:
 
 ```python
+# Fish Speech: reference-voice name + seed
 VOICE_CAST = {
     "narrator": ("female2", 42),   # the primary walkthrough voice
     "asker":    ("female1", 137),  # the "how do I do this?" call voice
 }
+
+# Bark: built-in preset + seed (v2/en_speaker_0 .. v2/en_speaker_9)
+BARK_VOICE_DEFAULTS = {
+    "narrator": ("v2/en_speaker_9", 43),   # production narrator
+    "asker":    ("v2/en_speaker_9", 137),
+}
 ```
 
-Seeds are arbitrary integers; just keep them **fixed and non-zero**.  A zero seed tells Fish Speech to re-randomize per call, which causes the drift the slot system exists to prevent.
+Seeds are arbitrary integers; just keep them **fixed and non-zero**.  A zero seed lets the backend re-randomize per call, which causes the drift the slot system exists to prevent.
 
 **Single-narrator scripts** (most walkthroughs) do nothing extra -- all cues default to the narrator slot and a single voice walks the viewer through the entire video.
 
@@ -258,7 +268,7 @@ def run(headless: bool = True):
         ...
 ```
 
-The openai backend ignores voice slots -- it keys on `TTS_VOICE` alone.  Slots apply only when `TTS_BACKEND=fish`.
+The openai backend ignores voice slots -- it keys on `TTS_VOICE` alone.  Slots apply when `TTS_BACKEND=bark-local` or `TTS_BACKEND=fish`.  A script-level `cast` override works for both: pass `("v2/en_speaker_X", seed)` for Bark or `("female3", seed)` for Fish.
 
 ### Pronunciation dictionary
 

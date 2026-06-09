@@ -10,7 +10,7 @@ Adapt to your project:
   - Set BASE_URL / credentials via environment variables
   - Override DemoRunner.login() if your auth flow differs
   - Adjust VIEWPORT for your app's layout
-  - Pick a TTS backend (openai-compatible or Fish Speech) and point at your endpoint
+  - Pick a TTS backend (Bark, openai-compatible, or Fish Speech) and point at your endpoint
   - Everything else works as-is
 """
 
@@ -49,20 +49,46 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 # 1.0 = normal narration pace, 0.5 = fast preview, 2.0 = slow/dramatic
 PACE = float(os.environ.get("DEMO_PACE", "1.0"))
 
-# TTS narration.  Two backends supported:
-#   "openai" -- any OpenAI-compatible TTS server (openedai-speech, etc.).
-#               Fast, consistent, no voice cloning.  Default.
-#   "fish"   -- Fish Speech 1.5 via its Gradio interface.  Voice cloning
-#               from preloaded references, deterministic seeding for voice
-#               continuity across cues.  Requires a Fish Speech endpoint.
+# TTS narration.  Three backends supported:
+#   "bark-local" -- Suno Bark via a small local HTTP daemon (POST /generate).
+#                   Fully offline, MIT-licensed, expressive.  Per-sentence
+#                   dispatch + deterministic seeding keeps a stable voice across
+#                   cues.  Default.  This is the backend we run in production.
+#   "openai"     -- any OpenAI-compatible TTS server (openedai-speech, etc.).
+#                   Fast, consistent, no voice cloning.
+#   "fish"       -- Fish Speech 1.5 via its Gradio interface.  Voice cloning
+#                   from preloaded references, deterministic seeding for voice
+#                   continuity across cues.  Requires a Fish Speech endpoint.
+#                   NOTE: check Fish Speech's licence before shipping output --
+#                   it was the licensing friction that pushed us to Bark.
 #
-# Point TTS_ENDPOINT at your chosen backend; OpenIVaC ships no hosted service.
-TTS_BACKEND = os.environ.get("TTS_BACKEND", "openai").lower()  # "openai" or "fish"
+# Point TTS_ENDPOINT (openai/fish) or BARK_ENDPOINT (bark-local) at your chosen
+# backend; OpenIVaC ships no hosted service.
+TTS_BACKEND = os.environ.get("TTS_BACKEND", "bark-local").lower()  # "bark-local", "openai", or "fish"
 TTS_ENDPOINT = os.environ.get("TTS_ENDPOINT", "http://localhost:8100/v1")
 TTS_VOICE = os.environ.get("TTS_VOICE", "shimmer")
 TTS_MODEL = os.environ.get("TTS_MODEL", "tts-1")
 TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Bark daemon -- a small local HTTP service wrapping Suno Bark that answers
+# `POST /generate` with base64 WAV.  See the README "Bark backend" section for
+# the daemon contract.  Knob defaults below are the production-tuned values:
+# voice preset `v2/en_speaker_9` at seed 43 reads warm-confident; the three
+# temperatures govern Bark's semantic/coarse/fine sampling stages.
+BARK_ENDPOINT = os.environ.get("BARK_ENDPOINT", "http://localhost:8202")
+BARK_SEMANTIC_TEMP = float(os.environ.get("BARK_SEMANTIC_TEMP", "0.6"))
+BARK_COARSE_TEMP = float(os.environ.get("BARK_COARSE_TEMP", "0.7"))
+BARK_FINE_TEMP = float(os.environ.get("BARK_FINE_TEMP", "0.35"))
+# Inter-sentence silence (ms) inserted when stitching per-sentence clips.
+BARK_SILENCE_MS = int(os.environ.get("BARK_SILENCE_MS", "250"))
+# Bark renders slow and even-toned -- pleasant, but it can read as flat at
+# native pace.  BARK_SPEED applies a pitch-preserving ffmpeg atempo pass to each
+# synthesized clip (NOT the silence gaps), so the voice lifts without changing
+# timbre.  1.0 = native; 1.08 = 8% faster, the production default.  Tunable
+# 1.05-1.10 to taste.  Folded into the narration cache key so a speed change
+# re-synths bark clips on the next run but leaves openai/fish caches untouched.
+BARK_SPEED = float(os.environ.get("BARK_SPEED", "1.08"))
 
 # Emotion tags on SubtitleCue are reserved metadata for a future backend that
 # interprets them.  The current Fish Speech endpoint reads parenthetical
@@ -103,20 +129,32 @@ VOICE_CAST: dict[str, tuple[str, int]] = {
     "asker": ("female1", 137),
 }
 
+# Bark slot -> (voice_preset, seed).  Bark resolves voice from one of its built-in
+# presets (`v2/en_speaker_0` .. `v2/en_speaker_9`) plus a seed; no per-sentence
+# reference audio needed (simpler than the Fish anchor flow).  `v2/en_speaker_9`
+# at seed 43 is the production narrator.  Scripts override per-cast through
+# ``cast_overrides={"narrator": ("v2/en_speaker_X", 99)}`` just like the Fish path.
+BARK_VOICE_DEFAULTS: dict[str, tuple[str, int]] = {
+    "narrator": ("v2/en_speaker_9", 43),
+    "asker": ("v2/en_speaker_9", 137),
+}
+
 
 def resolve_voice_slot(slot: str,
                        overrides: Optional[dict[str, tuple[str, int]]] = None) -> tuple[str, int]:
-    """Resolve a slot name to (reference_id, seed).
+    """Resolve a slot name to (reference_id, seed) -- or (voice_preset, seed) for Bark.
 
-    Checks ``overrides`` first (per-runner/per-script), then VOICE_CAST.
-    Falls back to narrator if the slot is unknown so scripts never break on
-    typos.
+    Checks ``overrides`` first (per-runner/per-script), then the backend-
+    appropriate cast table: BARK_VOICE_DEFAULTS when ``TTS_BACKEND`` is
+    bark-local, VOICE_CAST otherwise.  Falls back to narrator if the slot is
+    unknown so scripts never break on typos.
     """
     if overrides and slot in overrides:
         return overrides[slot]
-    if slot in VOICE_CAST:
-        return VOICE_CAST[slot]
-    return VOICE_CAST["narrator"]
+    cast = BARK_VOICE_DEFAULTS if TTS_BACKEND == "bark-local" else VOICE_CAST
+    if slot in cast:
+        return cast[slot]
+    return cast["narrator"]
 
 
 # ---------------------------------------------------------------------------
@@ -362,12 +400,18 @@ def _tts_preprocess(text: str, emotion: str = "") -> str:
       4. Emotion-prefix safety net -- strip any leading '(emotion) ' that
          would otherwise be read aloud.
 
+    For ``TTS_BACKEND == "bark-local"`` the acronym-spacing pass is skipped:
+    ALL-CAPS is Bark's own emphasis convention, so 'API' should stay 'API'
+    (read with emphasis), not become 'A P I'.  Unit expansion and the
+    pronunciation dict still apply -- they're general prosody helpers.
+
     ``emotion`` is accepted for signature compatibility with the cue pipeline
     but is no longer routed into the synth output.
     """
     processed = _expand_units(text)
     processed = _apply_pronunciations(processed)
-    processed = _ACRONYM_RE.sub(lambda m: " ".join(m.group(1)), processed)
+    if TTS_BACKEND != "bark-local":
+        processed = _ACRONYM_RE.sub(lambda m: " ".join(m.group(1)), processed)
     processed = _LEADING_PAREN_RE.sub("", processed)
     return processed
 
@@ -467,6 +511,211 @@ NARRATION_CACHE_DIR = OUTPUT_DIR / ".narration_cache"
 _CACHE_VERSION = "v1"
 
 
+# ---------------------------------------------------------------------------
+# Bark backend
+# ---------------------------------------------------------------------------
+# Bark's semantic stage degrades on long inputs, so we synthesize one sentence
+# at a time and stitch the clips with a short, deterministic silence gap.  This
+# keeps each clause on its own contour and gives clean, repeatable beat timing.
+# The daemon contract is intentionally tiny -- POST JSON, get base64 WAV back:
+#
+#   POST {BARK_ENDPOINT}/generate
+#   { "text": "...", "voice_preset": "v2/en_speaker_9", "do_sample": true,
+#     "seed": 43, "semantic_temperature": 0.6, "coarse_temperature": 0.7,
+#     "fine_temperature": 0.35, "return_base64_wav": true }
+#   -> 200 { "wav_base64": "<...>", "sample_rate": 24000 }
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+')
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Break preprocessed TTS text into sentence-sized chunks for per-clause synthesis."""
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text)]
+    return [p for p in parts if p]
+
+
+def _apply_atempo(path: Path, speed: float) -> None:
+    """Speed up a WAV in place via ffmpeg atempo (pitch-preserved).
+
+    Applied per-clip before concat, so only speech is sped -- the silence gaps
+    inserted by _bark_concat_with_silence keep their intended duration.  On any
+    ffmpeg failure the original clip is left untouched (fail-soft: a clip at
+    native pace beats a missing clip).
+    """
+    if speed == 1.0:
+        return
+    prefix = ["flatpak-spawn", "--host"] if shutil.which("flatpak-spawn") else []
+    tmp = path.with_name(path.stem + "_tempo.wav")
+    proc = subprocess.run(
+        prefix + ["ffmpeg", "-y", "-i", str(path),
+                  "-filter:a", f"atempo={speed:.3f}", str(tmp)],
+        capture_output=True,
+    )
+    if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+        tmp.replace(path)
+    else:
+        tmp.unlink(missing_ok=True)
+        print(f"  atempo pass failed (left clip at native pace): "
+              f"{proc.stderr.decode(errors='replace')[-200:]}")
+
+
+def _bark_synthesize_one(session, text: str, dest: Path,
+                         voice_preset: str, voice_seed: int) -> Optional[int]:
+    """POST one sentence to the Bark daemon and write the WAV.
+
+    Returns the daemon-reported sample_rate on success, None on failure.
+    ``do_sample=True`` keeps Bark in sampling mode so the seed actually drives
+    variation; ``return_base64_wav`` keeps the round trip JSON-only.
+    """
+    import base64
+    body = {
+        "text": text,
+        "voice_preset": voice_preset,
+        "do_sample": True,
+        "seed": voice_seed,
+        "semantic_temperature": BARK_SEMANTIC_TEMP,
+        "coarse_temperature": BARK_COARSE_TEMP,
+        "fine_temperature": BARK_FINE_TEMP,
+        "return_base64_wav": True,
+    }
+    try:
+        r = session.post(
+            f"{BARK_ENDPOINT.rstrip('/')}/generate",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(body),
+            timeout=600,
+        )
+    except Exception as e:
+        print(f"  Bark request failed: {e}")
+        return None
+    if r.status_code != 200:
+        print(f"  Bark HTTP {r.status_code}: {r.text[:300]}")
+        return None
+    try:
+        payload = r.json()
+    except ValueError:
+        print(f"  Bark non-JSON response: {r.text[:300]}")
+        return None
+    wav_b64 = payload.get("wav_base64")
+    if not wav_b64:
+        print(f"  Bark: no wav_base64 in response: {payload}")
+        return None
+    try:
+        dest.write_bytes(base64.b64decode(wav_b64))
+    except Exception as e:
+        print(f"  Bark: decode/write failed: {e}")
+        return None
+    sr = payload.get("sample_rate")
+    sample_rate = int(sr) if sr else 24000
+    if BARK_SPEED != 1.0:
+        _apply_atempo(dest, BARK_SPEED)
+    return sample_rate
+
+
+def _bark_concat_with_silence(segments: list[Path], output_path: Path,
+                              sample_rate: int, silence_ms: int) -> bool:
+    """Concat per-sentence WAVs with explicit silence between, then write the
+    final asset at ``output_path``.
+
+    Builds a silence file at the daemon's reported sample rate, then stitches
+    via the ffmpeg concat demuxer.  When the final extension is ``.mp3``,
+    ffmpeg re-encodes automatically -- that's the path the narration cache
+    uses.  When it's ``.wav`` we try ``-c copy`` first and fall back to a
+    re-encode if headers disagree.
+    """
+    if not segments:
+        return False
+    prefix = ["flatpak-spawn", "--host"] if shutil.which("flatpak-spawn") else []
+    if len(segments) == 1:
+        proc = subprocess.run(
+            prefix + ["ffmpeg", "-y", "-i", str(segments[0]), str(output_path)],
+            capture_output=True,
+        )
+        return proc.returncode == 0
+
+    tmpdir = output_path.parent
+    silence_path = tmpdir / f"_bark_silence_{silence_ms}ms_{sample_rate}.wav"
+    seconds = silence_ms / 1000.0
+    sil_cmd = [
+        "ffmpeg", "-y", "-f", "lavfi",
+        "-i", f"anullsrc=r={sample_rate}:cl=mono",
+        "-t", f"{seconds:.3f}",
+        str(silence_path),
+    ]
+    sil = subprocess.run(prefix + sil_cmd, capture_output=True)
+    if sil.returncode != 0:
+        print(f"  Bark silence-gen failed: {sil.stderr.decode(errors='replace')[-300:]}")
+        return False
+
+    list_path = tmpdir / "_bark_concat_list.txt"
+    lines: list[str] = []
+    for i, clip in enumerate(segments):
+        if i > 0:
+            lines.append(f"file '{silence_path.as_posix()}'")
+        lines.append(f"file '{clip.as_posix()}'")
+    list_path.write_text("\n".join(lines) + "\n")
+
+    out_is_wav = output_path.suffix.lower() == ".wav"
+    if out_is_wav:
+        cmd_copy = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_path), "-c", "copy", str(output_path),
+        ]
+        copy = subprocess.run(prefix + cmd_copy, capture_output=True)
+        if copy.returncode == 0:
+            return True
+
+    cmd_reenc = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", str(list_path),
+        "-ar", str(sample_rate), "-ac", "1",
+        str(output_path),
+    ]
+    reenc = subprocess.run(prefix + cmd_reenc, capture_output=True)
+    if reenc.returncode != 0:
+        err = reenc.stderr.decode(errors="replace")[-400:]
+        print(f"  Bark concat re-encode failed: {err}")
+        return False
+    return True
+
+
+def _bark_synthesize_sentence_split(tts_text: str, output_path: Path,
+                                    voice_preset: str, voice_seed: int) -> bool:
+    """Synthesize each sentence separately through Bark and stitch with silence.
+
+    Voice continuity is governed by ``voice_preset`` + ``seed`` -- Bark uses the
+    preset directly, no per-sentence reference audio.  One ``requests.Session``
+    is reused across sentences so the daemon's keep-alive survives across calls.
+    """
+    sentences = _split_sentences(tts_text)
+    if not sentences:
+        sentences = [tts_text]
+
+    try:
+        import requests as _requests
+    except ImportError:
+        print("  requests not installed -- run: pip install requests")
+        return False
+
+    session = _requests.Session()
+    tmpdir = tempfile.mkdtemp(prefix="openivac_bark_split_")
+    try:
+        segments: list[Path] = []
+        sample_rate = 24000
+        for i, sentence in enumerate(sentences):
+            seg = Path(tmpdir) / f"s{i:03d}.wav"
+            sr = _bark_synthesize_one(session, sentence, seg,
+                                      voice_preset, voice_seed)
+            if sr is None:
+                return False
+            sample_rate = sr
+            segments.append(seg)
+        return _bark_concat_with_silence(segments, output_path,
+                                         sample_rate, BARK_SILENCE_MS)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _synthesize_to_path(text: str, emotion: str, output_path: Path,
                         voice_slot: str = "narrator",
                         cast_overrides: Optional[dict[str, tuple[str, int]]] = None) -> bool:
@@ -475,6 +724,10 @@ def _synthesize_to_path(text: str, emotion: str, output_path: Path,
     Dispatches based on TTS_BACKEND.  Returns True on success.
     """
     tts_text = _tts_preprocess(text, emotion)
+    if TTS_BACKEND == "bark-local":
+        voice_preset, voice_seed = resolve_voice_slot(voice_slot, cast_overrides)
+        return _bark_synthesize_sentence_split(tts_text, output_path,
+                                               voice_preset, voice_seed)
     if TTS_BACKEND == "fish":
         voice_ref, voice_seed = resolve_voice_slot(voice_slot, cast_overrides)
         return _fish_speech_synthesize(tts_text, output_path, voice_ref, voice_seed)
@@ -522,12 +775,16 @@ def _narration_cache_key(text: str, emotion: str = "",
                          cast_overrides: Optional[dict[str, tuple[str, int]]] = None) -> str:
     # Include the resolved (ref_id, seed) so a cast change invalidates the
     # cache cleanly.  Emotion is not part of the key: it's metadata-only.
-    if TTS_BACKEND == "fish":
+    if TTS_BACKEND in ("fish", "bark-local"):
         voice_ref, voice_seed = resolve_voice_slot(voice_slot, cast_overrides)
         voice_key = f"{voice_slot}:{voice_ref}:{voice_seed}"
     else:
         voice_key = TTS_VOICE
     key_str = f"{_CACHE_VERSION}||{text}||{voice_key}||{TTS_BACKEND}"
+    if TTS_BACKEND == "bark-local":
+        # Tempo is baked into the cached clip, so it must key the cache --
+        # otherwise a speed change would silently reuse old-pace audio.
+        key_str += f"||tempo{BARK_SPEED}"
     return hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:16]
 
 
@@ -634,6 +891,8 @@ def add_narration(video_path: Path, srt_path: Path,
 
     if TTS_BACKEND == "fish":
         print(f"  Using Fish Speech backend at {TTS_ENDPOINT}")
+    elif TTS_BACKEND == "bark-local":
+        print(f"  Using Bark backend at {BARK_ENDPOINT}")
 
     if cues is None:
         cues = parse_srt(srt_path)
